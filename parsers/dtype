@@ -1,0 +1,131 @@
+import pandas as pd
+
+# базовый парсер импортируй из своего модуля
+class ExcelParser(BaseParser):
+    name = "mediaplan"
+
+    def __init__(self, file_path: str, config: dict):
+        self.file_path = file_path
+        self.cfg = config
+
+    # --- helpers ---
+    @staticmethod
+    def _norm(s):
+        return str(s).strip().replace('\n', ' ').lower()
+
+    def _flatten_aliases(self, columns):
+        """[] | [[canon, a1, a2], 'X'] -> (canon_order, alias2canon)"""
+        canon_order, alias2canon = [], {}
+        for item in columns or []:
+            if isinstance(item, list) and item:
+                canon = item[0]
+                canon_order.append(canon)
+                for a in item:
+                    alias2canon[self._norm(a)] = canon
+            elif isinstance(item, str):
+                canon_order.append(item)
+                alias2canon[self._norm(item)] = item
+        return canon_order, alias2canon
+
+    def _find_header_row(self, raw_df, required_columns, scan=50):
+        """поиск строки заголовков по алиасам"""
+        _, alias2canon = self._flatten_aliases(required_columns)
+        wanted = set(alias2canon.keys())
+        best = (0, 0)
+        limit = min(scan, len(raw_df))
+        for i in range(limit):
+            row = raw_df.iloc[i].map(self._norm).tolist()
+            score = len(set(row) & wanted)
+            if score > best[0]:
+                best = (score, i)
+        return best[1]
+
+    def _resolve_columns(self, df, required_columns):
+        """маппинг алиасов -> канонические имена"""
+        canon_order, alias2canon = self._flatten_aliases(required_columns)
+        norm2orig = {self._norm(c): c for c in df.columns}
+
+        # точный матч
+        pick_map = {}
+        for ncol, orig in norm2orig.items():
+            if ncol in alias2canon and alias2canon[ncol] not in pick_map:
+                pick_map[alias2canon[ncol]] = orig
+
+        # подстрочный матч (fallback)
+        keys = list(alias2canon.keys())
+        for ncol, orig in norm2orig.items():
+            hits = [k for k in keys if k and k in ncol]
+            if hits:
+                best = max(hits, key=len)
+                canon = alias2canon[best]
+                if canon not in pick_map:
+                    pick_map[canon] = orig
+
+        found = [c for c in canon_order if c in pick_map]
+        out = df[[pick_map[c] for c in found]].copy()
+        out.columns = found
+        return out
+
+    def _drop_blank_zero_rows(self, df):
+        n = df.applymap(lambda x: self._norm(x))
+        blank = n.apply(lambda r: all(c == '' for c in r), axis=1)
+        zeros = n.apply(lambda r: all(c in {'0', '0.0'} for c in r), axis=1)
+        return df[~(blank | zeros)]
+
+    # --- main ---
+    def parse(self):
+        sheet_name = self.cfg.get("SheetName")            # str | None
+        columns = self.cfg.get("ColumnList")              # ['A'] | [['Canon','alias1',...], 'B', ...]
+        add = self.cfg.get("AdditionalParameters", {})    # любые арг-ты read_excel
+        skiprows_cfg = self.cfg.get("skiprows", "auto")   # int | "auto"
+        scan_rows = int(self.cfg.get("HeaderScanRows", 50))
+        dtype = self.cfg.get("dtype", str)
+        drop_empty = bool(self.cfg.get("DropEmptyRows", True))
+
+        print(f"[ExcelParser] Файл: {self.file_path}, Лист: {sheet_name or '(все)'}")
+        print(f"ColumnList (с алиасами): {columns}")
+
+        # читаем сыро для поиска заголовка
+        raw = pd.read_excel(self.file_path, sheet_name=sheet_name, header=None, **{k:v for k,v in add.items() if k not in ('header','skiprows')})
+
+        def process_one(df_raw, sheet):
+            # определяем skiprows
+            if isinstance(skiprows_cfg, int):
+                hrow = skiprows_cfg
+            elif skiprows_cfg == "auto" and columns:
+                hrow = self._find_header_row(df_raw, columns, scan=scan_rows)
+            else:
+                hrow = 0
+
+            # финальное чтение с заголовком
+            df = pd.read_excel(
+                self.file_path,
+                sheet_name=sheet,
+                skiprows=hrow,
+                **{k:v for k,v in add.items() if k != 'skiprows'}
+            )
+
+            # колонкам применяем алиасы, если заданы
+            if columns:
+                df = self._resolve_columns(df, columns)
+
+            # чистка строк
+            if drop_empty and not df.empty:
+                df = self._drop_blank_zero_rows(df)
+
+            df['file_name'] = self.file_path.split('/')[-1]
+            df['sheet_name'] = sheet
+            return df
+
+        # если вернулся dict (много листов)
+        if isinstance(raw, dict):
+            result = {}
+            for sh, df_raw in raw.items():
+                try:
+                    result[sh] = process_one(df_raw, sh)
+                except Exception as e:
+                    print(f"⚠️ {sh}: {e}")
+            return result
+
+        # один лист
+        return process_one(raw, sheet_name or 0)
